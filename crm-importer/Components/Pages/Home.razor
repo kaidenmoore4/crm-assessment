@@ -1,0 +1,175 @@
+﻿@page "/"
+@rendermode InteractiveServer
+@inject IDbContextFactory<crm_importer.Data.crm_importerContext> DbFactory
+
+<MudAppBar Color="Color.Primary" Fixed="false">
+    CRM Submission System
+    <MudSpacer />
+    <label for="sheetInput">
+        <MudButton HtmlTag="label" Variant="MudBlazor.Variant.Filled" Color="MudBlazor.Color.Primary" StartIcon="@Icons.Material.Filled.UploadFile" for="sheetInput">
+            Upload Excel File
+        </MudButton>
+        <InputFile id="sheetInput" OnChange="HandleFileSelected" Accept=".csv, .xlsx, .xls" style="display: none"/>
+    </label>
+    <MudButton Variant="MudBlazor.Variant.Filled" Color="MudBlazor.Color.Primary" StartIcon="@Icons.Material.Filled.Save" Style="margin-left: 15px" OnClick="HandleCRMSubmission">
+        Submit to CRM
+    </MudButton>
+</MudAppBar>
+@if (showSuccess)
+{
+    <MudAlert Severity="Severity.Success" ContentAlignment="HorizontalAlignment.Center" ShowCloseIcon="true" CloseIconClicked="() => showSuccess = false">
+        CRM submission successful!
+    </MudAlert>
+}
+@if (errorMessage != string.Empty)
+{
+    <MudAlert Severity="Severity.Error" ContentAlignment="HorizontalAlignment.Center" ShowCloseIcon="true" CloseIconClicked="() => errorMessage = string.Empty">
+        @errorMessage
+    </MudAlert>
+}
+@if (notSubmitted)
+{
+    <MudAlert Severity="Severity.Warning" ContentAlignment="HorizontalAlignment.Center" ShowCloseIcon="true" CloseIconClicked="() => notSubmitted = false">
+        No Data Submitted! Please upload a sheet to continue. 
+    </MudAlert>
+}
+<MudDivider />
+<MudTable Items="@csvRows" Striped="true" Hover="true">
+    <ToolBarContent>
+        <MudText Typo="Typo.h6">CRM Upload Rows</MudText>
+    </ToolBarContent>
+    <HeaderContent>
+        <MudTh>Quote Sent Date</MudTh>
+        <MudTh>Sales Person</MudTh>
+        <MudTh>Project Name</MudTh>
+        <MudTh>Raw Data</MudTh>
+    </HeaderContent>
+    <RowTemplate>
+        <MudTd DataLabel="Quote Sent Date">@context.QuoteSentDate</MudTd>
+        <MudTd DataLabel="Sales Person">@context.SalesPerson</MudTd>
+        <MudTd DataLabel="Project Name">@context.ProjectName</MudTd>
+        <MudTd DataLabel="Raw Data">@context.raw</MudTd>
+    </RowTemplate>
+</MudTable>
+@if (csvRows.Count == 0)
+{
+    <MudCard Outlined="true">
+        <MudCardContent >
+            <MudText>No new content.</MudText>
+            <MudText Typo="Typo.body2">Upload a sheet with new values and processable values will be shown here.</MudText>
+        </MudCardContent>
+    </MudCard>
+}
+@code {
+    private List<Lead> csvRows = new List<Lead>();
+    private long maxFileSize = 10 * 1024 * 1024; // 10 MB
+    private bool showSuccess = false;
+    private string errorMessage = string.Empty;
+    private bool notSubmitted = false;
+
+    private async Task HandleCRMSubmission()
+    {
+        using var context = DbFactory.CreateDbContext();
+        context.Lead.AddRange(csvRows);
+        if(csvRows.Count == 0)
+        {
+            notSubmitted = true;
+        }
+        else
+        {
+            try
+            {
+                await context.SaveChangesAsync();
+                showSuccess = true;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Error saving leads: {ex.Message}");
+                errorMessage = "An error occurred while saving leads to the CRM. Please try again.";
+            }
+        }
+    }
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        csvRows.Clear();
+
+        using var context = DbFactory.CreateDbContext();
+        List<Lead> existingLeads = await context.Set<Lead>().ToListAsync();
+        var tempRows = new List<Lead>();
+
+        var file = e.File;
+
+        try
+        {
+            await using var stream = await handleCsv(file);
+            using var reader = new StreamReader(new MemoryStream(stream.ToArray()));
+            using var rawReader = new StreamReader(new MemoryStream(stream.ToArray()));
+            using var csvReader = new CsvReader(reader, CultureInfo.InvariantCulture);
+            csvReader.Context.RegisterClassMap<LeadMap>();
+
+            await rawReader.ReadLineAsync();
+
+            await foreach (var lead in csvReader.GetRecordsAsync<Lead>())
+            {
+                var raw = await rawReader.ReadLineAsync();
+                lead.raw = raw;
+                tempRows.Add(lead);
+            }
+
+        }
+        catch(Exception ex)
+        {
+            errorMessage = "Something went wrong, please try again";
+            Console.Error.WriteLine($"Error processing file: {ex.Message}");
+            throw new InvalidDataException("Something went wrong, please try again");
+        }
+
+
+        tempRows = tempRows.Where(x => !existingLeads.Any(existingLeads => existingLeads.ProjectName == x.ProjectName && existingLeads.SalesPerson == x.SalesPerson && existingLeads.QuoteSentDate == x.QuoteSentDate)).ToList();
+
+        csvRows.AddRange(tempRows);
+    }
+
+    async Task<MemoryStream> handleCsv(IBrowserFile file)
+    {
+        using var readStream = file.OpenReadStream(maxFileSize);
+        using var bufferStream = new MemoryStream();
+        await readStream.CopyToAsync(bufferStream);
+        bufferStream.Position = 0;
+
+        var memoryStream = new MemoryStream();
+
+        var extension = Path.GetExtension(file.Name).ToLowerInvariant();
+        if (extension == ".csv")
+        {
+            bufferStream.Position = 0;
+            await bufferStream.CopyToAsync(memoryStream);
+        }
+        else if (extension == ".xlsx" || extension == ".xls")
+        {
+            Workbook workbook = new Workbook();
+            workbook.LoadFromStream(bufferStream);
+            Worksheet sheet = workbook.Worksheets[0];
+            sheet.SaveToStream(memoryStream, ",", Encoding.UTF8);
+        }
+        else
+        {
+            throw new InvalidDataException("Unsupported file type, please upload a CSV or Excel file");
+        }
+
+        memoryStream.Position = 0;
+        return memoryStream;
+    }
+
+
+    public class LeadMap : ClassMap<Lead>
+    {
+        public LeadMap()
+        {
+            Map(m => m.QuoteSentDate).Name("QuoteSentDate");
+            Map(m => m.SalesPerson).Name("SalesPerson");
+            Map(m => m.ProjectName).Name("ProjectName");
+        }
+    }
+}
